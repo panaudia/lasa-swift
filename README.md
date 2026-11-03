@@ -10,12 +10,13 @@ jitter buffer. Design: `lasa-planning/plan/lasa-swift.md`; plan:
 (`ios-transport.md` §4.1). Raw QUIC with ALPN `moqt-16`; Apple exposes
 no WebTransport client.
 
-Status, 2026-11-03: lifted from `lasa-ios-probe`'s ProbeKit (step 1
-of the plan). What is here passes S1 to S4 on an iPhone 17; what is
-not yet here is the port map's "to port" rows in the spec §3 (state
-store and sync, presence and roster, the uplink sequencer, controls,
-coordinates), the engine's interruption handling (spec §4) and the
-public names of spec §2. The `LasaClient` type is still the probe's shape.
+Status, 2026-11-03: steps 1 to 3 of the plan. The transport and
+audio engine pass S1 to S4 on an iPhone 17; the engine carries the
+spec's §4 lifecycle handling; the LASA layer of spec §3 is ported
+from the TypeScript client with its tests (state, presence, uplink,
+controls, tickets) and the §2 surface is live against the server.
+Not yet: the sink-side audio wiring of §2.5 (`startCapture`,
+`playSink`), `LasaMotion`, and dev-cert pinning.
 
 ## Build and test
 
