@@ -1,0 +1,37 @@
+# The example app (lasa-swift.md §1): connect with a ticket, show the
+# roster, the meters and the route the session got. `xcodegen generate`
+# here makes LasaExample.xcodeproj (not committed). Requires Xcode 27.
+name: LasaExample
+options:
+  bundleIdPrefix: com.panaudia
+  deploymentTarget:
+    iOS: "26.0"
+  xcodeVersion: "27.0"
+packages:
+  lasa-swift:
+    path: ..
+targets:
+  LasaExample:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    dependencies:
+      - package: lasa-swift
+        product: LasaSwift
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        SWIFT_STRICT_CONCURRENCY: complete
+        OTHER_LDFLAGS: ["-lresolv"]
+    info:
+      path: Sources/Info.plist
+      properties:
+        NSMicrophoneUsageDescription: "LasaExample sends your voice into the space."
+        NSMotionUsageDescription: "LasaExample reads headphone motion for the listener's pose."
+        UIBackgroundModes: [audio]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+    scheme:
+      run:
+        config: Release

@@ -7,3 +7,5 @@ xcuserdata/
 live-runs/
 *.rec
 *.log
+Example/LasaExample.xcodeproj/
+Example/DerivedData/

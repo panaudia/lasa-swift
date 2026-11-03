@@ -1,6 +1,10 @@
 // The S4 pump (plan §5.7): the T5 pump with Swift in Go's place, and the
 // v4 jitter buffer in place of T5's fixed fill. No clock of its own.
 //
+// Probe-era: the product's path is CapturePump + SinkPipeline under
+// LasaClient.startCapture and playSink (2026-11-03); this class stays
+// for the probe's S4 tab and its record until that tab moves over.
+//
 // Uplink: the mic callback writes into the capture ring and signals; a
 // sender blocked on that signal wakes, encodes and sends every whole
 // 240-frame packet the ring holds, and blocks again. The sender is a

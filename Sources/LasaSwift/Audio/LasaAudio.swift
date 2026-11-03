@@ -150,8 +150,13 @@ public final class LasaAudio: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private var sourceNode: AVAudioSourceNode?
     private var sinkNode: AVAudioSinkNode?
-    private let source: PlaybackSource
-    private let capture: OpaquePointer    // ring_t*, mono
+    /// What the render blocks serve: set once by the probe's initialiser,
+    /// or attached and detached by the client's playSink and startCapture.
+    /// Read on the render thread through `slots` (a lock-free snapshot
+    /// taken at graph build), never under a lock there.
+    private var source: PlaybackSource?
+    private var capture: OpaquePointer?   // ring_t*, mono
+    public let preferredIODurationMS: Double
     private var observers: [NSObjectProtocol] = []
 
     // Written by the render blocks with plain stores; read by the app once
@@ -176,15 +181,39 @@ public final class LasaAudio: @unchecked Sendable {
     private var sizeHistogram = [UInt64](repeating: 0, count: maxFrames + 1)
 
     /// `session` is the app's: this object configures nothing on it (see
-    /// `configure`) and only observes it.
-    public init(session: AVAudioSession, playback: PlaybackSource, captureRing: OpaquePointer) {
+    /// `configure`) and only observes it. The client attaches what the
+    /// engine serves through playSink and startCapture.
+    public init(session: AVAudioSession, preferredIODurationMS: Double = 10) {
         self.session = session
-        source = playback
-        capture = captureRing
+        self.preferredIODurationMS = preferredIODurationMS
         let (stream, cont) = AsyncStream<Event>.makeStream(bufferingPolicy: .unbounded)
         events = stream
         eventsCont = cont
     }
+
+    /// The probe's form: the playback source and capture ring fixed at
+    /// construction (the T5 and S4 tabs).
+    public convenience init(session: AVAudioSession, playback: PlaybackSource, captureRing: OpaquePointer) {
+        self.init(session: session)
+        source = playback
+        capture = captureRing
+    }
+
+    /// Attaches or detaches what the engine serves. A running engine is
+    /// rebuilt on the new graph (one short gap); a stopped one takes the
+    /// change at its next start.
+    public func attach(playback: PlaybackSource?) {
+        source = playback
+        if state == .running { restart() }
+    }
+
+    public func attach(captureRing: OpaquePointer?) {
+        capture = captureRing
+        if state == .running { restart() }
+    }
+
+    public var isServingPlayback: Bool { source != nil }
+    public var isServingCapture: Bool { capture != nil }
 
     deinit {
         for o in observers { NotificationCenter.default.removeObserver(o) }
@@ -268,10 +297,16 @@ public final class LasaAudio: @unchecked Sendable {
         let stereo = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2)!
         let prime = guarded.withLock { $0.primeFrames }
 
+        let playback = self.source
         let source = AVAudioSourceNode(format: stereo) { [unowned self] _, _, frameCount, audioBufferList -> OSStatus in
             let t0 = mach_absolute_time()
             let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            if case .jitter(let jb) = self.source {
+            guard let playback else {
+                for ch in 0..<abl.count { memset(abl[ch].mData, 0, Int(abl[ch].mDataByteSize)) }
+                self.note(t0: t0, frames: frameCount)
+                return noErr
+            }
+            if case .jitter(let jb) = playback {
                 // The jitter buffer owns startup, fill and splices. One
                 // read per render call into the interleaved scratch, then
                 // de-interleave; silence comes back as zeros.
@@ -288,7 +323,7 @@ public final class LasaAudio: @unchecked Sendable {
                 self.note(t0: t0, frames: frameCount)
                 return noErr
             }
-            guard case .ring(let playback) = self.source else { return noErr }
+            guard case .ring(let playback) = playback else { return noErr }
             if !self.armed {
                 let fill = ring_fill(playback)
                 if fill >= prime {
@@ -322,28 +357,28 @@ public final class LasaAudio: @unchecked Sendable {
             return noErr
         }
 
-        let capture = self.capture
-        let sink = AVAudioSinkNode { _, frameCount, audioBufferList -> OSStatus in
-            let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
-            guard let src = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-            // Accumulate what arrived and wake the sender: the callback is
-            // the uplink's only clock (rule 3).
-            _ = ring_write(capture, src, frameCount)
-            ring_signal(capture)
-            return noErr
-        }
-
         engine.attach(source)
-        engine.attach(sink)
         engine.connect(source, to: engine.mainMixerNode, format: stereo)
-        // The input node dictates its own format; connecting with another
-        // one throws. The sink block reads channel 0 only, so a stereo
-        // input is fine, and a rate other than 48 kHz is reported and
-        // treated as a finding (the pump assumes 48 kHz).
-        let inFormat = engine.inputNode.outputFormat(forBus: 0)
-        engine.connect(engine.inputNode, to: sink, format: inFormat)
         sourceNode = source
-        sinkNode = sink
+        if let capture = self.capture {
+            let sink = AVAudioSinkNode { _, frameCount, audioBufferList -> OSStatus in
+                let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: audioBufferList))
+                guard let src = abl[0].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
+                // Accumulate what arrived and wake the sender: the callback is
+                // the uplink's only clock (rule 3).
+                _ = ring_write(capture, src, frameCount)
+                ring_signal(capture)
+                return noErr
+            }
+            engine.attach(sink)
+            // The input node dictates its own format; connecting with another
+            // one throws. The sink block reads channel 0 only, so a stereo
+            // input is fine, and a rate other than 48 kHz is reported and
+            // treated as a finding (the pump assumes 48 kHz).
+            let inFormat = engine.inputNode.outputFormat(forBus: 0)
+            engine.connect(engine.inputNode, to: sink, format: inFormat)
+            sinkNode = sink
+        }
         try engine.start()
     }
 
