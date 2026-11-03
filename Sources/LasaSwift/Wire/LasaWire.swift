@@ -32,31 +32,152 @@ public enum Lasa: Sendable {
     public static func presenceNamespace(space: String) -> [String] { [space, "presence"] }
 
     // MARK: Connection Config (§4.1)
+    //
+    // Entity, Setup and ConnectionConfig mirror schemata/entity.schema.json,
+    // setup.schema.json and connection.schema.json field for field, with
+    // the schema's hyphenated keys; the port of lasa/typescript/src/lasa/
+    // setup.ts (2026-11-03). JSON encoding is Foundation's JSONEncoder
+    // with sorted keys, so the bytes are stable. Divergence from the
+    // TypeScript: an empty ticket string is sent as given, not dropped
+    // (the existing bytes), and lockstep false is sent as false.
 
-    public struct Entity: Encodable, Sendable {
-        public var id: String
-        public var name: String
-        public var hears: [String]?
-        public var heardIn: [String]?
-        /// Free-form application attributes.
-        public var attrs: [String: String]?
+    /// A free-form attribute value (entity.schema.json attr-value): a
+    /// boolean, string, number, or an object of the same.
+    public indirect enum AttrValue: Codable, Equatable, Sendable {
+        case bool(Bool)
+        case string(String)
+        case number(Double)
+        case object([String: AttrValue])
 
-        public init(id: String, name: String, hears: [String]? = nil, heardIn: [String]? = nil, attrs: [String: String]? = nil) {
-            self.id = id; self.name = name; self.hears = hears; self.heardIn = heardIn; self.attrs = attrs
+        public init(from decoder: any Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let b = try? c.decode(Bool.self) { self = .bool(b); return }
+            if let s = try? c.decode(String.self) { self = .string(s); return }
+            if let d = try? c.decode(Double.self) { self = .number(d); return }
+            if let o = try? c.decode([String: AttrValue].self) { self = .object(o); return }
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "attr value must be a boolean, string, number or object")
         }
-        enum CodingKeys: String, CodingKey, Sendable { case id, name, hears, heardIn = "heard-in", attrs }
+
+        public func encode(to encoder: any Encoder) throws {
+            var c = encoder.singleValueContainer()
+            switch self {
+            case .bool(let b): try c.encode(b)
+            case .string(let s): try c.encode(s)
+            case .number(let d): try c.encode(d)
+            case .object(let o): try c.encode(o)
+            }
+        }
+    }
+
+    /// Pose frame (lasa-core.md §3): world (default) or head.
+    public enum Frame: String, Codable, Sendable { case world, head }
+
+    /// Degrees of freedom an entity's pose carries (default 6).
+    public enum DOF: Int, Codable, Sendable { case zero = 0, three = 3, six = 6 }
+
+    /// Latency-tolerance intent for an entity's audio path (§4.2).
+    public enum Quality: Int, Codable, Sendable { case interactive = 0, resilient = 1, playback = 2 }
+
+    /// pose.schema.json with plain Doubles; the client's own Pose type is
+    /// separate (Wire/Pose.swift) and converts as needed.
+    public struct Position: Codable, Equatable, Sendable {
+        public var x: Double, y: Double, z: Double
+        public init(x: Double, y: Double, z: Double) { self.x = x; self.y = y; self.z = z }
+    }
+    public struct Attitude: Codable, Equatable, Sendable {
+        public var yaw: Double, pitch: Double, roll: Double
+        public init(yaw: Double, pitch: Double, roll: Double) { self.yaw = yaw; self.pitch = pitch; self.roll = roll }
+    }
+    public struct InitialPose: Codable, Equatable, Sendable {
+        public var position: Position?
+        public var attitude: Attitude?
+        public init(position: Position? = nil, attitude: Attitude? = nil) { self.position = position; self.attitude = attitude }
+    }
+
+    /// Rendering parameters: gain multiplier, distance attenuation,
+    /// source size, directivity.
+    public struct Render: Codable, Equatable, Sendable {
+        public var gain: Double?
+        public var attenuation: Double?
+        public var size: Double?
+        public var directivity: Double?
+        public init(gain: Double? = nil, attenuation: Double? = nil, size: Double? = nil, directivity: Double? = nil) {
+            self.gain = gain; self.attenuation = attenuation; self.size = size; self.directivity = directivity
+        }
+    }
+
+    /// An entity definition, every field of entity.schema.json.
+    public struct Entity: Codable, Equatable, Sendable {
+        /// Unique within the space; identifier grammar (§2).
+        public var id: String
+        /// Display name, surfaced to other participants.
+        public var name: String
+        /// Priority entity (base profile).
+        public var priority: Bool?
+        /// Channels in which this entity's source is heard (omitted: ["main"]).
+        public var heardIn: [String]?
+        /// Channels this entity's sink listens to (omitted: ["main"]).
+        public var hears: [String]?
+        /// Free-form application attributes, published in state.
+        public var attrs: [String: AttrValue]?
+        public var frame: Frame?
+        public var dof: DOF?
+        public var quality: Quality?
+        /// Maximum redundancy offset 0 to 7 (§4.2, §5.1); 0 is none.
+        public var redundancy: Int?
+        public var initialPose: InitialPose?
+        public var render: Render?
+
+        public init(id: String, name: String, hears: [String]? = nil, heardIn: [String]? = nil, attrs: [String: AttrValue]? = nil,
+                    priority: Bool? = nil, frame: Frame? = nil, dof: DOF? = nil, quality: Quality? = nil, redundancy: Int? = nil,
+                    initialPose: InitialPose? = nil, render: Render? = nil) {
+            self.id = id; self.name = name; self.hears = hears; self.heardIn = heardIn; self.attrs = attrs
+            self.priority = priority; self.frame = frame; self.dof = dof; self.quality = quality
+            self.redundancy = redundancy; self.initialPose = initialPose; self.render = render
+        }
+
+        /// String-valued attrs, the probe's shape.
+        public init(id: String, name: String, hears: [String]? = nil, heardIn: [String]? = nil, attrs: [String: String]) {
+            self.init(id: id, name: name, hears: hears, heardIn: heardIn, attrs: attrs.mapValues { AttrValue.string($0) })
+        }
+
+        enum CodingKeys: String, CodingKey, Sendable {
+            case id, name, priority, heardIn = "heard-in", hears, attrs, frame, dof, quality, redundancy
+            case initialPose = "initial-pose", render
+        }
+    }
+
+    /// A setup instantiating a ticket-defined entity by id
+    /// (setup.schema.json, §4.2).
+    public struct Setup: Codable, Equatable, Sendable {
+        /// Id of an entity the ticket defines.
+        public var id: String
+        /// Unsigned attributes merged over the ticket's definition.
+        public var attrs: [String: AttrValue]?
+        /// Overrides the ticket definition's initial pose.
+        public var initialPose: InitialPose?
+
+        public init(id: String, attrs: [String: AttrValue]? = nil, initialPose: InitialPose? = nil) {
+            self.id = id; self.attrs = attrs; self.initialPose = initialPose
+        }
+        enum CodingKeys: String, CodingKey, Sendable { case id, attrs, initialPose = "initial-pose" }
     }
 
     public struct ConnectionConfig: Encodable, Sendable {
         public var clientID: String
+        /// Signed JWT ticket; omit only against a space allowing unticketed.
         public var ticket: String?
+        /// Ad-hoc entity definitions (unticketed, or presenter/admin tickets).
         public var entities: [Entity]?
+        /// Instantiations of ticket-defined entities (requires a ticket).
+        public var setups: [Setup]?
+        /// One frame counter across every entity source track (§4.2).
         public var lockstep: Bool?
 
-        public init(clientID: String, ticket: String? = nil, entities: [Entity]? = nil, lockstep: Bool? = nil) {
-            self.clientID = clientID; self.ticket = ticket; self.entities = entities; self.lockstep = lockstep
+        public init(clientID: String, ticket: String? = nil, entities: [Entity]? = nil, setups: [Setup]? = nil, lockstep: Bool? = nil) {
+            self.clientID = clientID; self.ticket = ticket; self.entities = entities; self.setups = setups; self.lockstep = lockstep
         }
-        enum CodingKeys: String, CodingKey, Sendable { case clientID = "client_id", ticket, entities, lockstep }
+        enum CodingKeys: String, CodingKey, Sendable { case clientID = "client_id", ticket, entities, setups, lockstep }
 
         public func json() throws -> [UInt8] {
             let enc = JSONEncoder()
@@ -115,19 +236,29 @@ public enum Lasa: Sendable {
     // MARK: State messages (§6.7)
 
     /// Client-authored ops carry no seq.
-    public enum UpstreamState: Sendable {
+    public indirect enum UpstreamState: Sendable, Equatable {
         case set(key: String, value: [UInt8])
         case clear(key: String)
+        /// Several ops the server applies together (type 3, varint count,
+        /// the ops; lasa-core.md §6.7). Never nested.
+        case group([UpstreamState])
 
         public func encode() -> [UInt8] {
             var w = ByteWriter(capacity: 32)
+            encode(into: &w)
+            return w.bytes
+        }
+
+        private func encode(into w: inout ByteWriter) {
             switch self {
             case .set(let key, let value):
                 w.u8(1); w.string(key); w.prefixed(value)
             case .clear(let key):
                 w.u8(2); w.string(key)
+            case .group(let ops):
+                w.u8(3); w.varint(UInt64(ops.count))
+                for op in ops { op.encode(into: &w) }
             }
-            return w.bytes
         }
     }
 

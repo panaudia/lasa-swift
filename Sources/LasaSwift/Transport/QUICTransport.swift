@@ -136,6 +136,12 @@ public final class QUICTransport: @unchecked Sendable {
     /// Called once, off the caller's task, when the connection reports
     /// `failed` or `cancelled`. The session hangs its teardown here.
     public var onDeath: (@Sendable (String) -> Void)?
+    /// The peer's CONNECTION_CLOSE application error, read from the
+    /// connection at the moment it failed: a LASA rejection code
+    /// (lasa-core.md §4.6) when the server closed deliberately. nil until
+    /// a failure, and nil for a transport-level death.
+    public var applicationError: (code: UInt64, reason: String?)? { appError.withLock { $0 } }
+    private let appError = OSAllocatedUnfairLock<(code: UInt64, reason: String?)?>(initialState: nil)
 
     public init(log: @escaping @Sendable (String) -> Void = { _ in }) { self.log = log }
 
@@ -159,6 +165,13 @@ public final class QUICTransport: @unchecked Sendable {
             switch state {
             case .failed(let e):
                 died.set(.success(()))
+                // The framework reports all-ones when the peer sent no
+                // application error.
+                let ae = conn.applicationError
+                if ae.code != UInt64.max {
+                    self?.appError.withLock { $0 = (ae.code, ae.reason) }
+                    log("connection application error 0x\(String(ae.code, radix: 16)) \(ae.reason ?? "")")
+                }
                 self?.onDeath?("\(e)")
             case .cancelled:
                 died.set(.success(()))
@@ -239,6 +252,9 @@ public final class MoQSession: @unchecked Sendable {
         var pendingDatagrams: [(alias: UInt64, group: UInt64, arrival: Int64, payload: [UInt8])] = []
         var pendingDatagramBytes = 0
         var subgroupHandlers: [UInt64: SubgroupHandler] = [:]
+        /// PUBLISH_DONE listeners by our request id (the state sync's
+        /// re-subscribe signal, lasa-core.md §6.6).
+        var publishDoneHandlers: [UInt64: @Sendable (UInt64) -> Void] = [:]
         var pendingObjects: [(MoQ.SubgroupHeader, UInt64, [UInt8])] = []
         /// Every task the session owns, by a serial id. Teardown cancels them all.
         var tasks: [UInt64: Task<Void, Never>] = [:]
@@ -250,11 +266,28 @@ public final class MoQSession: @unchecked Sendable {
     public init(transport: QUICTransport, log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.transport = transport
         self.log = log
-        transport.onDeath = { [weak self] why in self?.teardown(TransportError.connectionFailed(why)) }
+        transport.onDeath = { [weak self, weak transport] why in
+            // A deliberate server close carries a LASA code (§4.6); that
+            // code, not the framework's text, is the reason the session
+            // records.
+            if let ae = transport?.applicationError, ae.code <= UInt64(UInt32.max),
+               let rejection = LasaRejection.fromClose(code: UInt32(ae.code), reason: ae.reason) {
+                self?.teardown(rejection)
+            } else {
+                self?.teardown(TransportError.connectionFailed(why))
+            }
+        }
     }
 
     /// The reason the session ended, nil while it lives.
     public var closedError: Error? { state.withLock { $0.closed } }
+    /// Called once, after teardown, with the reason: a LasaRejection
+    /// when the server closed deliberately, a TransportError otherwise.
+    public var onClosed: (@Sendable (Error) -> Void)? {
+        get { closedHook.withLock { $0 } }
+        set { closedHook.withLock { $0 = newValue } }
+    }
+    private let closedHook = OSAllocatedUnfairLock<(@Sendable (Error) -> Void)?>(initialState: nil)
 
     // MARK: Ownership
 
@@ -315,6 +348,7 @@ public final class MoQSession: @unchecked Sendable {
         for w in ws { w.cont.resume(throwing: reason) }
         for w in iws { w.cont.resume(throwing: reason) }
         for t in tasks { t.cancel() }
+        closedHook.withLock { $0 }?(reason)
     }
 
     public func close() {
@@ -430,6 +464,13 @@ public final class MoQSession: @unchecked Sendable {
 
     // MARK: Routers
 
+    /// Called once, off the control loop's own task, when the server ends
+    /// the subscription `requestID` with PUBLISH_DONE (status code as the
+    /// argument). The state sync re-subscribes on it.
+    public func onPublishDone(requestID: UInt64, _ h: @escaping @Sendable (UInt64) -> Void) {
+        state.withLock { $0.publishDoneHandlers[requestID] = h }
+    }
+
     public func registerDatagramHandler(alias: UInt64, _ h: @escaping DatagramHandler) {
         let drained: [(UInt64, Int64, [UInt8])] = state.withLock { s in
             s.datagramHandlers[alias] = h
@@ -443,6 +484,10 @@ public final class MoQSession: @unchecked Sendable {
 
     public func unregisterDatagramHandler(alias: UInt64) {
         state.withLock { $0.datagramHandlers[alias] = nil }
+    }
+
+    public func unregisterSubgroupHandler(alias: UInt64) {
+        state.withLock { _ = $0.subgroupHandlers.removeValue(forKey: alias) }
     }
 
     public func registerSubgroupHandler(alias: UInt64, _ h: @escaping SubgroupHandler) {
@@ -562,6 +607,8 @@ public final class MoQSession: @unchecked Sendable {
             var r = ByteReader(f.body)
             let rid = try r.varint(); let status = try r.varint()
             log("PUBLISH_DONE request \(rid) status \(status)")
+            let h = state.withLock { $0.publishDoneHandlers.removeValue(forKey: rid) }
+            h?(status)
         case .maxRequestID:
             log("MAX_REQUEST_ID \(try MoQ.parseRequestID(f.body))")
         case .goaway:
