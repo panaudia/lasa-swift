@@ -241,6 +241,17 @@ public final class SwiftPump: @unchecked Sendable {
         task?.cancel()
     }
 
+    /// Stamps a lifecycle or engine transition into the record (the T4
+    /// vocabulary: 1 foreground, 2 background, 3 inactive; LasaAudio's
+    /// 30 to 35), so a background episode is a fact in the file.
+    public func mark(_ code: UInt32, arg: UInt64 = 0) {
+        rec.appendEvent(nowNS: ArrivalClock.nowNS(), code: code, arg: arg)
+    }
+
+    public static let markForeground: UInt32 = 1
+    public static let markBackground: UInt32 = 2
+    public static let markInactive: UInt32 = 3
+
     /// Writes the arrival record with a stop mark.
     public func flush(to url: URL) throws {
         rec.appendEvent(nowNS: ArrivalClock.nowNS(), code: Self.eventStop)

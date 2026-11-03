@@ -102,6 +102,14 @@ public final class S4Session: @unchecked Sendable {
         }
     }
 
+    /// Routes the engine's transitions into this session's record.
+    #if os(iOS)
+    public func attach(_ audio: LasaAudio) {
+        let pump = self.pump
+        audio.marks = { code, arg in pump.mark(code, arg: arg) }
+    }
+    #endif
+
     public func stop() {
         pump.stop()
         continuation?.finish()
