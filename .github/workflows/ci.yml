@@ -1,0 +1,17 @@
+# Build and test on a macOS runner with Xcode 27. The live suite needs
+# PROBE_LIVE and a reachable server, so it is not run here.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_27.2.app || sudo xcode-select -s /Applications/Xcode.app
+      - run: swift --version
+      - run: swift build
+      - run: swift test
