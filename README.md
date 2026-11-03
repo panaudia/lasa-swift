@@ -10,13 +10,14 @@ jitter buffer. Design: `lasa-planning/plan/lasa-swift.md`; plan:
 (`ios-transport.md` §4.1). Raw QUIC with ALPN `moqt-16`; Apple exposes
 no WebTransport client.
 
-Status, 2026-11-03: steps 1 to 3 of the plan. The transport and
+Status, 2026-11-03: steps 1 to 4 of the plan. The transport and
 audio engine pass S1 to S4 on an iPhone 17; the engine carries the
 spec's §4 lifecycle handling; the LASA layer of spec §3 is ported
 from the TypeScript client with its tests (state, presence, uplink,
 controls, tickets) and the §2 surface is live against the server.
-Not yet: the sink-side audio wiring of §2.5 (`startCapture`,
-`playSink`), `LasaMotion`, and dev-cert pinning.
+The audio surface (`startCapture`, `playSink`) and the example app in
+`Example/` (XcodeGen: `cd Example && xcodegen generate`) are in. Not
+yet: `LasaMotion`, dev-cert pinning, ambi playout.
 
 ## Build and test
 
