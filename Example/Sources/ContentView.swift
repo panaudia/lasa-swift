@@ -8,11 +8,18 @@ struct Settings {
     var clientID = "ios-" + String(UUID().uuidString.prefix(8)).lowercased()
     var ticket = ""
     var name = "iPhone"
+    /// Maximum redundancy offset declared on the entity (core §4.2),
+    /// both the sink request and the uplink bound. Offset n repairs a
+    /// burst of up to n lost packets and costs a 2 * (n + 2) * 5 ms
+    /// buffer floor. Without it a lost sink packet drains the jitter
+    /// buffer 5 ms with nothing to conceal the hole (tests plan §7.14).
+    var redundancy = 2
 }
 
 @MainActor
 final class SessionModel: ObservableObject {
     var address = "", space = "", clientID = "", ticket = "", name = ""
+    var redundancy = 0
     @Published var route: AudioRoute = .device
     @Published var sending = false
     @Published var connected = false
@@ -31,18 +38,22 @@ final class SessionModel: ObservableObject {
     private var tasks: [Task<Void, Never>] = []
     private let lifecycle = UIApplicationLifecycle()
 
-    var earsID: String { clientID + "-ears" }
-    var micID: String { clientID + "-mic" }
+    // One entity carries both the sink and the source. The server
+    // never renders an entity's own source into its own sink, so this
+    // is what keeps you from hearing your own microphone; two entities
+    // (ears and mic) would hear each other.
+    var entityID: String { clientID + "-me" }
 
     func connect(_ s: Settings) {
         guard client == nil else { return }
         address = s.address; space = s.space; clientID = s.clientID; ticket = s.ticket; name = s.name
+        redundancy = s.redundancy
         status = "connecting"
         var o = LasaClientOptions(address: address, spaceID: space, clientID: clientID)
         o.ticket = ticket.isEmpty ? nil : ticket
         o.entities = [
-            Lasa.Entity(id: earsID, name: name, hears: [space == "main" ? "main" : space]),
-            Lasa.Entity(id: micID, name: name + " mic", heardIn: [space == "main" ? "main" : space]),
+            Lasa.Entity(id: entityID, name: name, hears: [space], heardIn: [space],
+                        redundancy: redundancy > 0 ? redundancy : nil),
         ]
         o.lifecycle = lifecycle
         o.log = { line in print("[lasa] \(line)") }
@@ -58,8 +69,8 @@ final class SessionModel: ObservableObject {
                 routeReport = report.description
                 let a = LasaAudio(session: avs, preferredIODurationMS: 10)
                 audio = a
-                player = try await c.playSink(entity: earsID, format: .binaural, audio: a)
-                if sending { capture = try await c.startCapture(entity: micID, audio: a) }
+                player = try await c.playSink(entity: entityID, format: .binaural, audio: a)
+                if sending { capture = try await c.startCapture(entity: entityID, audio: a) }
                 connected = true
                 status = "connected, handshake \(Int(c.stats.handshakeMS)) ms"
                 tasks.append(Task { [weak self] in
@@ -82,7 +93,7 @@ final class SessionModel: ObservableObject {
         sending = on
         guard let c = client, let a = audio, connected else { return }
         Task {
-            if on { capture = try? await c.startCapture(entity: micID, audio: a) }
+            if on { capture = try? await c.startCapture(entity: entityID, audio: a) }
             else { capture?.stop(); capture = nil }
         }
     }
@@ -117,6 +128,7 @@ struct ContentView: View {
     @AppStorage("clientID") private var clientID = Settings().clientID
     @AppStorage("ticket") private var ticket = Settings().ticket
     @AppStorage("name") private var name = Settings().name
+    @AppStorage("redundancy") private var redundancy = Settings().redundancy
 
     var body: some View {
         NavigationStack {
@@ -134,13 +146,14 @@ struct ContentView: View {
                         Text("headset").tag(AudioRoute.headset)
                         Text("headset HQ").tag(AudioRoute.headsetHighQuality)
                     }.disabled(model.connected)
+                    Stepper("FEC frames: \(redundancy)", value: $redundancy, in: 0...7).disabled(model.connected)
                     Toggle("send microphone", isOn: Binding(get: { model.sending }, set: { model.setSending($0) }))
                     if !model.routeReport.isEmpty { Text(model.routeReport).font(.footnote).foregroundStyle(.secondary) }
                 }
                 Section("Session") {
                     Button(model.connected ? "Leave" : "Join") {
                         if model.connected { model.disconnect() }
-                        else { model.connect(Settings(address: address, space: space, clientID: clientID, ticket: ticket, name: name)) }
+                        else { model.connect(Settings(address: address, space: space, clientID: clientID, ticket: ticket, name: name, redundancy: redundancy)) }
                     }
                     Text(model.status).font(.footnote.monospaced())
                     if !model.engine.isEmpty { Text(model.engine).font(.footnote.monospaced()).foregroundStyle(.secondary) }
