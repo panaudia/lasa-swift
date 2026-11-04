@@ -91,8 +91,17 @@ extension LasaClient {
     /// session as the app configured it.
     private func ensureRunning(_ audio: LasaAudio) throws {
         let st = audioState
-        if st.audio == nil { st.audio = audio }
-        if audio.state == .idle || audio.state == .stopped { _ = try audio.start() }
+        if st.audio == nil {
+            st.audio = audio
+            setEngineHooks(EngineHooks(isRunning: { [audio] in audio.state == .running },
+                                       isInterrupted: { [audio] in audio.state == .interrupted },
+                                       resume: { [audio] in audio.resume() }))
+        }
+        switch audio.state {
+        case .idle, .stopped: _ = try audio.start()
+        case .interrupted: audio.resume()
+        case .running: break
+        }
     }
 
     /// Captures the microphone into `entity`'s source track: the capture
@@ -178,6 +187,7 @@ extension LasaClient {
         guard st.capture == nil, st.sink == nil, let a = st.audio else { return }
         a.stop()
         st.audio = nil
+        setEngineHooks(nil)
     }
 
     /// The meters: what went up and what came down in the last window.

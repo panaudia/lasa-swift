@@ -269,6 +269,26 @@ public final class LasaAudio: @unchecked Sendable {
         eventsCont.finish()
     }
 
+    /// After an interruption: reactivates the session the app handed in
+    /// (an interruption deactivates it, and the engine will not start on
+    /// an inactive one; Apple's rule for every API but AVAudioPlayer),
+    /// then restarts the engine. Paul, 2026-11-04: reactivating is part
+    /// of resuming what the library was given, not ownership. Also the
+    /// client's try on return to the foreground while still interrupted,
+    /// since the ended notification does not always arrive. A failure
+    /// (another app still holds the session) is `engineStartFailed`;
+    /// the state stays interrupted and the app may call this again.
+    public func resume() {
+        do {
+            try session.setActive(true)
+        } catch {
+            mark(Self.markEngineStartFailed)
+            eventsCont.yield(.engineStartFailed("session reactivation: \(error)"))
+            return
+        }
+        restart()
+    }
+
     /// Rebuilds the graph on the session's current formats and starts the
     /// engine again. Called by the §4 transitions, and by the app after
     /// an interruption that ended without `shouldResume`.
@@ -412,7 +432,7 @@ public final class LasaAudio: @unchecked Sendable {
             let resume = options?.contains(.shouldResume) ?? false
             mark(Self.markInterruptionEnded, arg: resume ? 1 : 0)
             eventsCont.yield(.interruptionEnded(shouldResume: resume))
-            if resume { restart() }
+            if resume { self.resume() }
         default:
             break
         }

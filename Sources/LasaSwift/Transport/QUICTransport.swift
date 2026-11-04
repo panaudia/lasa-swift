@@ -36,6 +36,10 @@ public struct TransportConfig: Sendable {
     public var idleTimeoutMS: Int = 30_000
     /// Our max_datagram_frame_size transport parameter: what we accept.
     public var maxDatagramFrameSize: Int = 1500
+    /// The framework's QUIC keep-alive (`NetworkConnection.keepalive`,
+    /// `.seconds(n)`): 0 leaves it off, the framework's default. S7
+    /// (tests plan §5.10) chooses the product's value from evidence.
+    public var keepAliveSeconds: Int = 0
 
     public init(host: String, port: UInt16) { self.host = host; self.port = port }
 
@@ -136,6 +140,40 @@ public final class QUICTransport: @unchecked Sendable {
     /// Called once, off the caller's task, when the connection reports
     /// `failed` or `cancelled`. The session hangs its teardown here.
     public var onDeath: (@Sendable (String) -> Void)?
+    /// The framework's path reports (S6, tests plan §5.9): a path update
+    /// with the interfaces it now runs over, a viability change, and a
+    /// better-path hint. Reported as they arrive, on the framework's
+    /// queue; migration, if any, is the framework's own doing. iOS 27
+    /// and macOS 27 only: the 26 SDKs have no per-connection handlers.
+    public var onPath: (@Sendable (PathEvent) -> Void)?
+
+    public enum PathEvent: Sendable, CustomStringConvertible {
+        /// `summary` is a short interface list such as "en0" or
+        /// "pdp_ip0 expensive".
+        case changed(summary: String)
+        case viable(Bool)
+        case betterPath(Bool)
+
+        public var description: String {
+            switch self {
+            case .changed(let s): return "path \(s)"
+            case .viable(let v): return v ? "path viable" : "path not viable"
+            case .betterPath(let b): return b ? "better path available" : "no better path"
+            }
+        }
+    }
+
+    /// One line for a path: its interfaces by name, then status when not
+    /// satisfied, expensive, constrained. The same shape the example
+    /// app prints for the device path on iOS 26.
+    public static func summarise(_ path: NWPath) -> String {
+        var s = path.availableInterfaces.map { "\($0.name)(\($0.type))" }.joined(separator: ",")
+        if s.isEmpty { s = "none" }
+        if path.status != .satisfied { s += " \(path.status)" }
+        if path.isExpensive { s += " expensive" }
+        if path.isConstrained { s += " constrained" }
+        return s
+    }
     /// The peer's CONNECTION_CLOSE application error, read from the
     /// connection at the moment it failed: a LASA rejection code
     /// (lasa-core.md §4.6) when the server closed deliberately. nil until
@@ -160,6 +198,24 @@ public final class QUICTransport: @unchecked Sendable {
         slot.withLock { $0 = conn }
         let log = self.log
         let died = OneShot<Void>()
+        // The per-connection path handlers arrived with the 27 SDKs; on
+        // iOS 26 (the phone, 2026-11) they are absent and the app watches
+        // the device path itself (NWPathMonitor) if it wants the marks.
+        if #available(iOS 27.0, macOS 27.0, *) {
+            conn.onPathUpdate { [weak self] _, path in
+                let summary = QUICTransport.summarise(path)
+                log("path update: \(summary)")
+                self?.onPath?(.changed(summary: summary))
+            }
+            conn.onViabilityUpdate { [weak self] _, viable in
+                log("path viable: \(viable)")
+                self?.onPath?(.viable(viable))
+            }
+            conn.onBetterPathUpdate { [weak self] _, better in
+                log("better path: \(better)")
+                self?.onPath?(.betterPath(better))
+            }
+        }
         conn.onStateUpdate { [weak self] _, state in
             log("connection state: \(state)")
             switch state {
@@ -186,6 +242,15 @@ public final class QUICTransport: @unchecked Sendable {
         let stream = try await conn.openStream(directionality: .bidirectional)
         let t1 = DispatchTime.now().uptimeNanoseconds
         controlStream = stream
+        if let p = conn.currentPath { log("path at handshake: \(QUICTransport.summarise(p))") }
+        // Set once the connection is ready: the QUIC metadata the setting
+        // writes to does not exist before the handshake (set before
+        // start() it had no effect: the idle session died at 30 s, S7
+        // from the Mac 2026-11-04).
+        if config.keepAliveSeconds > 0 {
+            conn.keepalive = .seconds(config.keepAliveSeconds)
+            log("keep-alive set: \(conn.keepalive)")
+        }
 
         return HandshakeResult(
             negotiatedALPN: conn.negotiatedALPN,

@@ -37,6 +37,9 @@ public struct LasaClientOptions: Sendable {
     public var lockstep = false
     public var establishDeadlineSeconds: Double = 10
     public var idleTimeoutMS = 30_000
+    /// The framework's QUIC keep-alive in seconds; 0 is off (the
+    /// default until S7 chooses, tests plan §5.10).
+    public var keepAliveSeconds = 0
     /// The app's foreground and background transitions (§2.2). nil: the
     /// client infers nothing about suspension.
     public var lifecycle: (any AppLifecycle)?
@@ -83,7 +86,25 @@ public final class LasaClient: @unchecked Sendable {
         case closed(code: UInt32?, reason: String?)
         case suspended
         case resumed(ProbeResult)
+        /// The app entered the background with the engine not running
+        /// (§4: interrupted, or no audio at all), so the process is
+        /// about to be suspended and the client is closing the
+        /// connection now, inside a hold from the lifecycle object;
+        /// `closed` follows. Reconnecting on return is the app's.
+        case backgrounded
+        /// The framework's path report (S6): interfaces, viability, a
+        /// better path. Informational; the connection migrates or dies
+        /// on its own and `closed` says which.
+        case pathUpdated(QUICTransport.PathEvent)
     }
+
+
+    struct EngineHooks: Sendable {
+        var isRunning: @Sendable () -> Bool
+        var isInterrupted: @Sendable () -> Bool
+        var resume: @Sendable () -> Void
+    }
+    func setEngineHooks(_ h: EngineHooks?) { g.withLock { $0.engine = h } }
 
     public struct Stats: Sendable {
         public var handshakeMS: Double = 0
@@ -107,6 +128,10 @@ public final class LasaClient: @unchecked Sendable {
         var publishers: [String: EntityPublisher] = [:]
         var syncs: [StateSync] = []
         var lifecycleTask: Task<Void, Never>?
+        /// The engine's state for the §4 rules, set by the audio surface
+        /// while a pipeline is attached: whether it is running, and the
+        /// resume to try on return to the foreground while interrupted.
+        var engine: EngineHooks?
         var lastActivityNS: Int64 = 0
         var closedReason: Error?
         var finished = false
@@ -125,6 +150,7 @@ public final class LasaClient: @unchecked Sendable {
         events = stream
         eventsCont = cont
         session.onClosed = { [weak self] reason in self?.sessionClosed(reason) }
+        transport.onPath = { [weak self] e in self?.eventsCont.yield(.pathUpdated(e)) }
     }
 
     public convenience init(_ options: Options) {
@@ -158,6 +184,7 @@ public final class LasaClient: @unchecked Sendable {
         try cfg.assertLockstepSupported()
         var tc = try TransportConfig(address: config.address)
         tc.idleTimeoutMS = config.idleTimeoutMS
+        tc.keepAliveSeconds = config.keepAliveSeconds
         let param = try cfg.setupParam()
         if case .bytes(let b) = param.value { configBytes = b.count }
         let (h, params) = try await session.establish(tc, extra: [param], oversize: oversize,
@@ -215,11 +242,13 @@ public final class LasaClient: @unchecked Sendable {
 
     // MARK: Lifecycle (§2.2, §4)
 
-    private func watch(_ lifecycle: any AppLifecycle) {
+    func watch(_ lifecycle: any AppLifecycle) {
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             for await t in lifecycle.transitions {
                 guard let self, !Task.isCancelled else { return }
                 switch t {
+                case .didEnterBackground:
+                    await self.enteredBackground(lifecycle)
                 case .didBecomeActive:
                     await self.resumed()
                 default:
@@ -230,12 +259,30 @@ public final class LasaClient: @unchecked Sendable {
         g.withLock { $0.lifecycleTask = task }
     }
 
+    /// §4's background rule (Paul, 2026-11-04): with the engine running
+    /// the audio background mode keeps the process alive and nothing is
+    /// done; with it not running the process is about to be suspended,
+    /// so the connection is closed now, deliberately, under a hold from
+    /// the lifecycle object, and the server sees an immediate departure
+    /// rather than a 30 s ghost.
+    private func enteredBackground(_ lifecycle: any AppLifecycle) async {
+        if session.closedError != nil { return }
+        if g.withLock({ $0.engine?.isRunning() }) == true { return }
+        let hold = await MainActor.run { lifecycle.hold(for: "lasa background close") }
+        eventsCont.yield(.backgrounded)
+        session.close()
+        hold?.end()
+    }
+
     /// On return to the foreground: a gap in receive-loop activity longer
     /// than half the idle timeout is a suspension, then the session is
     /// probed at once (a SUBSCRIBE the server must refuse: a round trip
     /// with no side effect) so the app learns alive or dead within the
     /// T7 design point rather than at the idle timeout.
     private func resumed() async {
+        // The interruption-ended notification does not always arrive;
+        // the return to the foreground is the other place to resume.
+        if let e = g.withLock({ $0.engine }), e.isInterrupted() { e.resume() }
         if session.closedError != nil { return }
         let gapNS = Self.nowNS() - g.withLock { $0.lastActivityNS }
         if gapNS > Int64(config.idleTimeoutMS) * 500_000 {

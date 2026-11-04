@@ -13,8 +13,24 @@ public enum AppTransition: Sendable {
     case didBecomeActive
 }
 
+/// A hold on the process for a short piece of work after the app has
+/// entered the background (the close of §4): the lifecycle object's
+/// own mechanism, `UIApplication.beginBackgroundTask` in the
+/// convenience. `end()` releases it; releasing twice is harmless.
+public protocol BackgroundHold: Sendable {
+    func end()
+}
+
 public protocol AppLifecycle: Sendable {
     var transitions: AsyncStream<AppTransition> { get }
+    /// Asks the app to keep the process running while the library does
+    /// `name`; nil when the app has no such mechanism, in which case the
+    /// work runs on whatever time the system allows.
+    @MainActor func hold(for name: String) -> BackgroundHold?
+}
+
+public extension AppLifecycle {
+    @MainActor func hold(for name: String) -> BackgroundHold? { nil }
 }
 
 #if os(iOS)
@@ -43,6 +59,27 @@ public final class UIApplicationLifecycle: AppLifecycle, @unchecked Sendable {
 
     deinit {
         for o in observers { NotificationCenter.default.removeObserver(o) }
+    }
+
+    /// A UIKit background task: about thirty seconds, the expiration
+    /// handler ending it if the work has not.
+    public func hold(for name: String) -> BackgroundHold? {
+        let h = UIKitHold()
+        h.id = UIApplication.shared.beginBackgroundTask(withName: name) { h.end() }
+        return h.id == .invalid ? nil : h
+    }
+
+    private final class UIKitHold: BackgroundHold, @unchecked Sendable {
+        var id: UIBackgroundTaskIdentifier = .invalid
+        private let lock = NSLock()
+        func end() {
+            lock.lock()
+            let id = self.id
+            self.id = .invalid
+            lock.unlock()
+            guard id != .invalid else { return }
+            Task { @MainActor in UIApplication.shared.endBackgroundTask(id) }
+        }
     }
 }
 #endif

@@ -16,8 +16,13 @@ spec's §4 lifecycle handling; the LASA layer of spec §3 is ported
 from the TypeScript client with its tests (state, presence, uplink,
 controls, tickets) and the §2 surface is live against the server.
 The audio surface (`startCapture`, `playSink`) and the example app in
-`Example/` (XcodeGen: `cd Example && xcodegen generate`) are in. Not
-yet: `LasaMotion`, dev-cert pinning, ambi playout.
+`Example/` (XcodeGen: `cd Example && xcodegen generate`) are in.
+Step 5 (2026-11-04): keep-alive, path reports, the §4 interruption
+and background rules (resume reactivates the session; a background
+with the engine stopped closes the connection under a lifecycle
+hold), and the example's reconnect loop, log and S6/S7 controls are
+built; the device cases are the next runs. Not yet: `LasaMotion`,
+dev-cert pinning, ambi playout.
 
 ## Build and test
 
@@ -25,6 +30,7 @@ yet: `LasaMotion`, dev-cert pinning, ambi playout.
 swift build
 swift test                                   # vectors, replays, Opus timing
 scripts/live-suite.sh                        # S1 to S4 smokes against test.panaudia.com
+PROBE_LIVE=test.panaudia.com:443 S7_LIVE=1 swift test --filter S7LiveTests   # S7 idle holds, 50 s each
 ```
 
 Xcode 27 (`DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`).
